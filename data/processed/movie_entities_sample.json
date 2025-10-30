@@ -1,0 +1,53 @@
+[
+  {
+    "movie_id": 1,
+    "title": "10 cloverfield lane",
+    "genres": [
+      "Thriller",
+      "Science Fiction",
+      "Drama",
+      "Horror"
+    ],
+    "actors": [
+      "John Goodman",
+      "Mary Elizabeth Winstead",
+      "John Gallagher Jr.",
+      "Douglas M. Griffin",
+      "Suzanne Cryer"
+    ],
+    "directors": [
+      "Dan Trachtenberg"
+    ],
+    "keywords": [
+      "kidnapping",
+      "paranoia",
+      "bunker",
+      "basement",
+      "survivalist",
+      "apocalypse",
+      "car accident",
+      "captive"
+    ],
+    "runtime": 104.0,
+    "release_year": 2016
+  },
+  {
+    "movie_id": 2,
+    "title": "10 things i hate about you",
+    "genres": [
+      "Comedy",
+      "Romance",
+      "Drama"
+    ],
+    "actors": [
+      "Heath Ledger",
+      "Julia Stiles",
+      "Joseph Gordon-Levitt",
+      "Larisa Oleynik",
+      "David Krumholtz"
+    ],
+    "directors": [
+      "Gil Junger"
+    ],
+    "keywords": [
+      "high school",

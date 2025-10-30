@@ -1,0 +1,103 @@
+{
+  "actors": {
+    "1072_ctowyi": {
+      "John Goodman": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          7.0
+        ],
+        "count": 1,
+        "mean": 7.0,
+        "std": 0.0
+      },
+      "Mary Elizabeth Winstead": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          7.0
+        ],
+        "count": 1,
+        "mean": 7.0,
+        "std": 0.0
+      },
+      "John Gallagher Jr.": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          7.0
+        ],
+        "count": 1,
+        "mean": 7.0,
+        "std": 0.0
+      },
+      "Douglas M. Griffin": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          7.0
+        ],
+        "count": 1,
+        "mean": 7.0,
+        "std": 0.0
+      },
+      "Suzanne Cryer": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          7.0
+        ],
+        "count": 1,
+        "mean": 7.0,
+        "std": 0.0
+      }
+    },
+    "3336_MovieSonic": {
+      "John Goodman": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          10.0
+        ],
+        "count": 1,
+        "mean": 10.0,
+        "std": 0.0
+      },
+      "Mary Elizabeth Winstead": {
+        "movies": [
+          "10 cloverfield lane"
+        ],
+        "movie_ids": [
+          1
+        ],
+        "ratings": [
+          10.0
+        ],
+        "count": 1,
+        "mean": 10.0,
+        "std": 0.0
+      },

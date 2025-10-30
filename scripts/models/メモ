@@ -1,0 +1,73 @@
+ベースラインから徐々に複雑化していく↓
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_mlp_baseline_usernorm.py
+Ep 099 | Loss 0.357 | Val MAE 1.135 RMSE 1.582 ρ 0.775
+Ep 100 | Loss 0.357 | Val MAE 1.016 RMSE 1.421 ρ 0.779
+=== TEST ===
+Test → MAE 0.905 | RMSE 1.243 | ρ 0.812
+
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_dualphase_usernorm.py
+
+Ep 451 | Loss 0.499 | Val MAE 1.139 RMSE 1.495 ρ 0.662
+Ep 452 | Loss 0.503 | Val MAE 1.139 RMSE 1.495 ρ 0.662
+
+Early stopping @ 452
+
+=== TEST ===
+Test → MAE 1.141 | RMSE 1.525 | ρ 0.630
+
+
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_dualphase_attention_usernorm.py
+
+Ep 052 | Loss 0.349 | Val MAE 1.264 RMSE 1.727 ρ 0.615
+Ep 053 | Loss 0.345 | Val MAE 1.243 RMSE 1.697 ρ 0.633
+
+Early stopping @ 53
+
+=== TEST ===
+Test → MAE 1.168 | RMSE 1.571 | ρ 0.658
+
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_dualphase_mha_gate_usernorm.py
+Ep 065 | Loss 0.446 | Val MAE 1.198 RMSE 1.620 ρ 0.684
+Ep 066 | Loss 0.446 | Val MAE 1.200 RMSE 1.623 ρ 0.684
+
+Early stopping @ 66
+
+=== TEST ===
+Test → MAE 1.172 | RMSE 1.538 | ρ 0.623
+
+Saved best checkpoint → /Users/watanabesaki/PycharmProjects/AARAN/outputs/v2_6_2_7_dualphase_mha_gate_best.pt
+
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_aaran.py
+
+Ep 045 | Loss 1.634 | Val MAE 1.249 RMSE 1.696 ρ 0.612
+Ep 046 | Loss 1.642 | Val MAE 1.242 RMSE 1.689 ρ 0.615
+Early stopping @ 46
+=== TEST ===
+Test → MAE 1.236 | RMSE 1.646 | ρ 0.597
+
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_aaran_v2_gat.py
+Ep 045 | Loss 1.639 | Val MAE 1.215 RMSE 1.655 ρ 0.628
+Ep 046 | Loss 1.623 | Val MAE 1.209 RMSE 1.654 ρ 0.628
+Ep 047 | Loss 1.617 | Val MAE 1.209 RMSE 1.654 ρ 0.628
+Ep 048 | Loss 1.605 | Val MAE 1.218 RMSE 1.666 ρ 0.624
+Ep 049 | Loss 1.631 | Val MAE 1.213 RMSE 1.656 ρ 0.630
+Early stopping @ 49
+=== TEST ===
+Test → MAE 1.232 | RMSE 1.639 | ρ 0.587
+
+/Users/watanabesaki/PycharmProjects/AARAN/scripts/models/train_aaran_v3_full.py
+Ep 035 | Loss 1.868 | Val MAE 1.244 RMSE 1.686 ρ 0.615
+Ep 036 | Loss 1.870 | Val MAE 1.235 RMSE 1.673 ρ 0.618
+Early stopping @ 36
+=== TEST ===
+Test → MAE 1.241 | RMSE 1.646 | ρ 0.582
+
+
+Ep 036 | Loss 1.839 | Val MAE 1.228 RMSE 1.671 ρ 0.624
+Ep 037 | Loss 1.815 | Val MAE 1.234 RMSE 1.684 ρ 0.616
+Ep 038 | Loss 1.817 | Val MAE 1.235 RMSE 1.679 ρ 0.620
+Early stopping @ 38
+=== TEST ===
+Test → MAE 1.232 | RMSE 1.639 | ρ 0.595
+
+プロセスは終了コード 0 で終了しました
