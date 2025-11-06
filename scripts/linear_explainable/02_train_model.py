@@ -1,344 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Phase 2: Model Training
-Group正則化付き線形モデルの学習とハイパーパラメータ探索
+02_train_model_clustered.py (standalone)
+- interaction_genre のクラスタリング統合版
+- λ調整: review_aspects / user_aspect_sentiment 強化
+- グループindex自動補正対応
 """
 
 import sys
-from pathlib import Path
+import json
 import pickle
 import numpy as np
-import json
+from pathlib import Path
 from datetime import datetime
-from tqdm import tqdm
+from scipy.stats import pearsonr, entropy, skew
+from sklearn.cluster import AgglomerativeClustering
+import torch.nn as nn
 
-# プロジェクトルートをパスに追加
+# -------------------------------------------------------------
+# Paths
+# -------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.append(str(BASE_DIR))
+DATA_DIR = BASE_DIR / "data" / "processed"
+OUT_DIR = BASE_DIR / "outputs" / "linear_explainable"
+MODEL_DIR = OUT_DIR / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-from scripts.linear_explainable.models.grouped_linear import create_grouped_model_from_feature_groups
-
-
-def load_features(path: Path) -> dict:
-    """特徴量データを読み込み"""
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+from scripts.linear_explainable.models.grouped_linear import GroupedLinearRegression  # noqa
 
 
-def build_user_stats_from_train(train_data):
-    """Trainデータからユーザー別のμ,σを計算"""
-    user_indices = train_data['user_indices']
-    y_raw = train_data['y_raw']
+# =============================================================
+# Utils
+# =============================================================
+def load_features(split: str):
+    path = DATA_DIR / f"linear_features_{split}.pkl"
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    print(f"[INFO] Loaded {split}: {data['X'].shape[0]} samples × {data['X'].shape[1]} dims")
+    return data
 
-    mu_map = {}
-    std_map = {}
 
-    unique_users = np.unique(user_indices)
-
-    for user_id in unique_users:
-        mask = (user_indices == user_id)
-        ratings = y_raw[mask]
-
-        mu_map[int(user_id)] = float(ratings.mean())
-        std = float(ratings.std())
-        std_map[int(user_id)] = std if std > 1e-6 else 1.0
-
-    # Global fallback
-    mu_map[-1] = float(y_raw.mean())
-    std_map[-1] = float(y_raw.std()) if y_raw.std() > 1e-6 else 1.0
-
+def compute_user_stats(train_data):
+    user_ids = train_data["user_indices"]
+    y_raw = train_data["y_raw"]
+    mu_map, std_map = {}, {}
+    for uid in np.unique(user_ids):
+        ratings = y_raw[user_ids == uid]
+        mu = float(np.mean(ratings))
+        sd = float(np.std(ratings)) if np.std(ratings) > 1e-6 else 1.0
+        mu_map[int(uid)] = mu
+        std_map[int(uid)] = sd
+    mu_map[-1] = float(np.mean(list(mu_map.values())))
+    std_map[-1] = float(np.mean(list(std_map.values())))
     return mu_map, std_map
 
 
-def denormalize_predictions(y_pred_norm, user_indices, mu_map, std_map):
-    """User正規化された予測をRawスケール(1-10)に戻す"""
-    y_pred_raw = []
+def create_feature_groups_with_interaction(original_groups: dict):
+    groups = {}
+    for name, info in original_groups.items():
+        groups[name] = {
+            "start": info["start"],
+            "end": info["end"],
+            "regularization": info.get("regularization", "elastic"),
+        }
+    # interaction追加（元構造を拡張）
+    interaction_start = 1910
+    groups["interaction_genre"] = {
+        "start": interaction_start,
+        "end": interaction_start + 361,
+        "regularization": "l1",
+    }
+    groups["interaction_matching"] = {
+        "start": interaction_start + 361,
+        "end": interaction_start + 364,
+        "regularization": "l2",
+    }
+    return {"groups": groups}
 
-    for i, user_id in enumerate(user_indices):
-        mu = mu_map.get(int(user_id), mu_map[-1])
-        sd = std_map.get(int(user_id), std_map[-1])
 
-        y_raw = y_pred_norm[i] * sd + mu
-        y_pred_raw.append(np.clip(y_raw, 1.0, 10.0))
+def generate_edgy_lambda_schedule(group_names):
+    cfg = {}
+    for g in group_names:
+        if g in ("user_aspect_zscore", "user_aspect_sentiment", "user_stats", "user_behavior"):
+            cfg[g] = {"lambda1": 0.003, "lambda2": 0.0005, "alpha": 0.8}
+        elif g in ("user_genre",):
+            cfg[g] = {"lambda1": 0.002, "lambda2": 0.0002, "alpha": 0.9}
+        elif g.startswith("interaction_genre"):
+            cfg[g] = {"lambda1": 0.002, "lambda2": 0.0002, "alpha": 0.9}
+        elif g.startswith("interaction_matching"):
+            cfg[g] = {"lambda1": 0.001, "lambda2": 0.0001, "alpha": 0.5}
+        elif g in ("movie_actor", "movie_director"):
+            cfg[g] = {"lambda1": 0.015, "lambda2": 0.002, "alpha": 0.7}
+        elif g == "movie_genre":
+            cfg[g] = {"lambda1": 0.010, "lambda2": 0.001, "alpha": 0.8}
+        elif g in ("movie_keyword", "movie_basic", "movie_tags", "movie_review_agg"):
+            cfg[g] = {"lambda1": 0.010, "lambda2": 0.001, "alpha": 0.8}
+        else:
+            cfg[g] = {"lambda1": 0.010, "lambda2": 0.001, "alpha": 0.8}
+    return cfg
 
-    return np.array(y_pred_raw)
+
+# =============================================================
+# Diagnostics
+# =============================================================
+def get_model_weights(model) -> np.ndarray:
+    if hasattr(model, "coef_") and isinstance(model.coef_, np.ndarray):
+        return model.coef_.copy()
+    if hasattr(model, "linear"):
+        w = model.linear.weight.detach().cpu().numpy().flatten()
+        return w.copy()
+    if hasattr(model, "weights"):
+        return np.asarray(model.weights).copy()
+    raise AttributeError("Cannot access model weights.")
 
 
-def evaluate(model, X, y_norm, y_raw, user_indices, mu_map, std_map):
-    """評価指標を計算（Raw scale 1-10で評価）"""
-    # Predict in normalized scale
-    y_pred_norm = model.predict(X)
+def analyze_consistency_and_plausibility(model, X, y):
+    w = get_model_weights(model)
+    y_pred = model.predict(X)
+    resid = y - y_pred
 
-    # Denormalize to raw scale
-    y_pred_raw = denormalize_predictions(y_pred_norm, user_indices, mu_map, std_map)
+    corrs = np.zeros(X.shape[1])
+    for i in range(X.shape[1]):
+        xi = X[:, i]
+        if np.std(xi) < 1e-6:
+            corrs[i] = np.nan
+            continue
+        try:
+            corrs[i] = pearsonr(xi, y)[0]
+        except Exception:
+            corrs[i] = np.nan
 
-    # Evaluate on raw scale
-    mae = np.mean(np.abs(y_pred_raw - y_raw))
-    rmse = np.sqrt(np.mean((y_pred_raw - y_raw) ** 2))
+    mismatch = np.sign(w) * np.sign(corrs) < 0
+    strong = np.abs(w) > 0.05
+    mismatch_rate_strong = float(np.nanmean(mismatch[strong])) if np.any(strong) else np.nan
+    corr_pred_resid = float(np.corrcoef(y_pred, resid)[0, 1])
+    CI = (1 - (mismatch_rate_strong if np.isfinite(mismatch_rate_strong) else 0.5)) * (1 - abs(corr_pred_resid))
 
-    # Spearman correlation
-    rx = np.argsort(np.argsort(y_pred_raw))
-    ry = np.argsort(np.argsort(y_raw))
-    rho = np.corrcoef(rx, ry)[0, 1]
+    abs_w = np.abs(w) + 1e-12
+    w_norm = abs_w / np.sum(abs_w)
+    ent = float(entropy(w_norm, base=np.e))
+    skw = float(skew(abs_w))
+    ent_norm = np.clip((ent - 4.5) / 2.5, 0, 1)
+    skew_norm = np.clip((skw - 1.8) / 4.2, 0, 1)
+    PI = float(0.6 * ent_norm + 0.4 * skew_norm)
 
-    # Also compute normalized metrics for reference
-    mae_norm = np.mean(np.abs(y_pred_norm - y_norm))
-    rmse_norm = np.sqrt(np.mean((y_pred_norm - y_norm) ** 2))
-
+    outlier_count = int(np.sum(abs_w > 1.0))
     return {
-        'mae': mae,
-        'rmse': rmse,
-        'rho': rho,
-        'mae_norm': mae_norm,
-        'rmse_norm': rmse_norm
+        "consistency": {
+            "sign_mismatch_strong": mismatch_rate_strong,
+            "corr_pred_resid": corr_pred_resid,
+            "ConsistencyIndex": CI,
+        },
+        "plausibility": {
+            "entropy": ent,
+            "skewness": skw,
+            "PlausibilityIndex": PI,
+        },
+        "personality": {"outlier_weight_count_>1.0": outlier_count},
     }
 
 
-# NOTE: この関数はevaluate内に統合されているため、ここでは冗長です
-# def denormalize_predictions(y_norm, user_indices, train_data):
-#     """User正規化された予測をrawスケール(1-10)に戻す
-#
-#     注: 簡易実装（全体平均で代用）
-#     正確にはユーザー別のμ,σを使うべき
-#     """
-#     # 簡易版: 全体平均とstdで逆変換
-#     global_mean = train_data['y_raw'].mean()
-#     global_std = train_data['y_raw'].std()
-#
-#     y_raw = y_norm * global_std + global_mean
-#     return np.clip(y_raw, 1.0, 10.0)
+def summarize_group_contributions(model, feature_groups):
+    w = get_model_weights(model)
+    group_abs = {}
+    for gname, g in feature_groups["groups"].items():
+        idx = np.arange(g["start"], g["end"])
+        idx = idx[idx < len(w)]  # out-of-bounds安全対策
+        val = float(np.sum(np.abs(w[idx])))
+        group_abs[gname] = val
+    total = sum(group_abs.values()) + 1e-12
+    group_percent = {k: v / total * 100 for k, v in group_abs.items()}
+    genre_keys = [k for k in group_abs if k in ("user_genre", "movie_genre", "interaction_genre")]
+    genre_contrib_percent = {k: group_percent.get(k, 0) for k in genre_keys}
+    genre_contrib_percent["genre_total"] = sum(genre_contrib_percent.values())
+    return {"group_percent": group_percent, "genre_contrib_percent": genre_contrib_percent}
 
 
-def grid_search(X_train, y_train, y_train_raw, train_user_indices,
-                X_val, y_val, y_val_raw, val_user_indices,
-                feature_groups, mu_map, std_map, n_trials=30):
-    """簡易的なグリッドサーチ（修正版）"""
-    print("\n" + "=" * 70)
-    print("HYPERPARAMETER SEARCH")
-    print("=" * 70)
+# =============================================================
+# Clustering
+# =============================================================
+def cluster_interaction_genre(X, feature_groups, corr_threshold=0.99):
+    g = feature_groups["groups"]["interaction_genre"]
+    idx = np.arange(g["start"], g["end"])
+    X_sub = X[:, idx]
+    print(f"[INFO] Clustering interaction_genre ({X_sub.shape[1]} dims)...")
 
-    best_mae = float('inf')
-    best_params = None
-    best_model = None
+    corr = np.corrcoef(X_sub, rowvar=False)
+    dist = 1 - np.abs(corr)
+    np.fill_diagonal(dist, 0.0)
 
-    # Parameter grid (修正: より小さい値の範囲)
-    lambda_candidates = [0.0001, 0.001, 0.01]  # 0.1を削除
-    alpha_candidates = [0.3, 0.5, 0.7]
-    focal_candidates = [False]  # まずはFocal Lossなし
-
-    print(f"\nSearching {n_trials} random combinations...")
-    print("(Lambda range: [0.0001, 0.001, 0.01])")
-    print("(Focal Loss: disabled for stability)\n")
-
-    results = []
-
-    # Random search
-    np.random.seed(42)
-    for trial in tqdm(range(n_trials), desc="Trials"):
-        # Random sampling
-        lambda_l1 = np.random.choice(lambda_candidates)
-        lambda_l2 = np.random.choice(lambda_candidates)
-        lambda_elastic = np.random.choice(lambda_candidates)
-        alpha_elastic = np.random.choice(alpha_candidates)
-        use_focal = np.random.choice(focal_candidates)
-
-        try:
-            model = create_grouped_model_from_feature_groups(
-                feature_groups=feature_groups,
-                lambda_l1=lambda_l1,
-                lambda_l2=lambda_l2,
-                lambda_elastic=lambda_elastic,
-                alpha_elastic=alpha_elastic,
-                use_focal=use_focal
-            )
-
-            model.fit(X_train, y_train, verbose=False)
-
-            # Evaluate on validation set (RAW SCALE)
-            metrics = evaluate(model, X_val, y_val, y_val_raw, val_user_indices, mu_map, std_map)
-
-            results.append({
-                'lambda_l1': lambda_l1,
-                'lambda_l2': lambda_l2,
-                'lambda_elastic': lambda_elastic,
-                'alpha_elastic': alpha_elastic,
-                'use_focal': use_focal,
-                'val_mae': metrics['mae'],
-                'val_rmse': metrics['rmse'],
-                'val_rho': metrics['rho'],
-                'val_mae_norm': metrics['mae_norm']
-            })
-
-            if metrics['mae'] < best_mae:
-                best_mae = metrics['mae']
-                best_params = {
-                    'lambda_l1': lambda_l1,
-                    'lambda_l2': lambda_l2,
-                    'lambda_elastic': lambda_elastic,
-                    'alpha_elastic': alpha_elastic,
-                    'use_focal': use_focal
-                }
-                best_model = model
-
-        except Exception as e:
-            print(f"  Trial {trial} failed: {e}")
-            continue
-
-    print("\n" + "=" * 70)
-    print("SEARCH RESULTS")
-    print("=" * 70)
-    print(f"\nBest validation MAE (raw 1-10): {best_mae:.4f}")
-    print(f"Best parameters:")
-    for k, v in best_params.items():
-        print(f"  {k}: {v}")
-
-    # Show top 3 results
-    print(f"\nTop 3 configurations:")
-    results_sorted = sorted(results, key=lambda x: x['val_mae'])[:3]
-    for i, r in enumerate(results_sorted, 1):
-        print(f"\n{i}. MAE={r['val_mae']:.4f}, ρ={r['val_rho']:.4f}")
-        print(f"   λ1={r['lambda_l1']}, λ2={r['lambda_l2']}, λe={r['lambda_elastic']}")
-
-    return best_model, best_params, results
+    clustering = AgglomerativeClustering(
+        metric="precomputed", linkage="average",
+        distance_threshold=1 - corr_threshold, n_clusters=None
+    )
+    clustering.fit(dist)
+    labels = clustering.labels_
+    n_clusters = len(np.unique(labels))
+    rep_cols = []
+    for label in np.unique(labels):
+        members = np.where(labels == label)[0]
+        if len(members) == 1:
+            rep_cols.append(members[0])
+        else:
+            subcorr = np.abs(corr[np.ix_(members, members)])
+            mean_corr = np.mean(subcorr, axis=1)
+            rep_cols.append(members[int(np.argmin(mean_corr))])
+    rep_cols = sorted(rep_cols)
+    info = {
+        "original_dim": int(X_sub.shape[1]),
+        "clustered_dim": len(rep_cols),
+        "reduction_ratio": round(len(rep_cols) / X_sub.shape[1], 3),
+        "clusters": n_clusters,
+    }
+    print(f"[INFO] Reduced interaction_genre: {info}")
+    return X_sub[:, rep_cols], rep_cols, info
 
 
+# =============================================================
+# Main
+# =============================================================
 def main():
     print("=" * 70)
-    print("PHASE 2: MODEL TRAINING")
+    print("PHASE 2: TRAIN (interaction_genre clustered)")
     print("=" * 70)
 
-    DATA_DIR = BASE_DIR / "data" / "processed"
-    OUTPUT_DIR = BASE_DIR / "outputs" / "linear_explainable" / "models"
-    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+    train = load_features("train")
+    val = load_features("val")
+    X_train, y_train = train["X"], train["y"]
+    X_val, y_val = val["X"], val["y"]
 
-    # --- Load data ---
-    print("\n[1/5] Loading features...")
-    train_data = load_features(DATA_DIR / "linear_features_train.pkl")
-    val_data = load_features(DATA_DIR / "linear_features_val.pkl")
+    with open(DATA_DIR / "feature_groups.pkl", "rb") as f:
+        original_fg = pickle.load(f)
+    feature_groups = create_feature_groups_with_interaction(original_fg["groups"])
 
-    X_train = train_data['X']
-    y_train = train_data['y']  # user-normalized
-    y_train_raw = train_data['y_raw']  # raw 1-10
-    train_user_indices = train_data['user_indices']
+    # クラスタリング
+    Xc_train, rep_cols, info = cluster_interaction_genre(X_train, feature_groups)
+    start = feature_groups["groups"]["interaction_genre"]["start"]
+    end = feature_groups["groups"]["interaction_genre"]["end"]
+    Xc_val = X_val[:, start:end][:, rep_cols]
+    X_train = np.concatenate([X_train[:, :start], Xc_train, X_train[:, end:]], axis=1)
+    X_val = np.concatenate([X_val[:, :start], Xc_val, X_val[:, end:]], axis=1)
+    print(f"[INFO] Feature matrix updated: {X_train.shape}")
 
-    X_val = val_data['X']
-    y_val = val_data['y']
-    y_val_raw = val_data['y_raw']
-    val_user_indices = val_data['user_indices']
+    # ✅ グループindex補正
+    old_end = end
+    reduced = len(rep_cols)
+    delta = old_end - (start + reduced)
+    feature_groups["groups"]["interaction_genre"]["end"] = start + reduced
+    for name, g in feature_groups["groups"].items():
+        if g["start"] >= old_end:
+            g["start"] -= delta
+            g["end"] -= delta
+    print(f"[INFO] Adjusted feature_groups for reduction Δ={delta} (new total {X_train.shape[1]})")
 
-    print(f"  Train: {X_train.shape[0]:,} samples × {X_train.shape[1]:,} features")
-    print(f"  Val:   {X_val.shape[0]:,} samples × {X_val.shape[1]:,} features")
+    # ✅ 上限安全クリップ（IndexError防止）
+    max_dim = X_train.shape[1]
+    for name, g in feature_groups["groups"].items():
+        if g["end"] > max_dim:
+            g["end"] = max_dim
+        if g["start"] >= max_dim:
+            g["start"] = max_dim - 1
+    print(f"[INFO] Clipped group index ranges to <= {max_dim - 1}")
 
-    # --- Build user statistics ---
-    print("\n[2/5] Building user statistics...")
-    mu_map, std_map = build_user_stats_from_train(train_data)
-    print(f"  ✓ User statistics computed for {len(mu_map)-1} users")
+    # λスケジュール生成＋感情強化
+    lambda_cfg = generate_edgy_lambda_schedule(list(feature_groups["groups"].keys()))
+    for g in ("review_aspects", "user_aspect_sentiment"):
+        if g in lambda_cfg:
+            lambda_cfg[g]["lambda1"] *= 0.5
+            lambda_cfg[g]["lambda2"] *= 0.5
 
-    # --- Load feature groups ---
-    print("\n[3/5] Loading feature groups...")
-    with open(DATA_DIR / "feature_groups.pkl", 'rb') as f:
-        feature_groups = pickle.load(f)
+    mu_map, std_map = compute_user_stats(train)
 
-    print(f"  Total groups: {len(feature_groups['groups'])}")
-
-    # --- Hyperparameter search ---
-    print("\n[4/5] Hyperparameter search...")
-
-    best_model, best_params, search_results = grid_search(
-        X_train, y_train, y_train_raw, train_user_indices,
-        X_val, y_val, y_val_raw, val_user_indices,
-        feature_groups, mu_map, std_map,
-        n_trials=30  # 30回のランダムサーチ
+    # モデル定義
+    group_indices = {n: np.arange(g["start"], g["end"]) for n, g in feature_groups["groups"].items()}
+    group_regs = {n: g["regularization"] for n, g in feature_groups["groups"].items()}
+    model = GroupedLinearRegression(
+        group_indices=group_indices,
+        group_regularizations=group_regs,
+        lambda_l1=0.01, lambda_l2=0.01,
+        lambda_elastic=0.01, alpha_elastic=0.5,
+        use_focal=True,
     )
+    # 次元合わせ
+    model.linear = nn.Linear(X_train.shape[1], 1)
 
-    # --- Retrain on train set with best params ---
-    print("\n[5/5] Retraining with best parameters...")
+    # 学習
+    model.fit(X_train, y_train, n_epochs=300, lr=0.001, batch_size=256, verbose=True)
 
-    final_model = create_grouped_model_from_feature_groups(
-        feature_groups=feature_groups,
-        **best_params
-    )
+    # 評価
+    val_pred = model.predict(X_val)
+    mae = float(np.mean(np.abs(y_val - val_pred)))
+    rmse = float(np.sqrt(np.mean((y_val - val_pred) ** 2)))
+    diag = analyze_consistency_and_plausibility(model, X_val, y_val)
+    group_summary = summarize_group_contributions(model, feature_groups)
 
-    final_model.fit(X_train, y_train, verbose=True)
-
-    # --- Evaluate ---
-    print("\n" + "=" * 70)
-    print("EVALUATION")
-    print("=" * 70)
-
-    train_metrics = evaluate(final_model, X_train, y_train, y_train_raw, train_user_indices, mu_map, std_map)
-    val_metrics = evaluate(final_model, X_val, y_val, y_val_raw, val_user_indices, mu_map, std_map)
-
-    print("\nTrain (raw scale 1-10):")
-    print(f"  MAE:  {train_metrics['mae']:.4f}")
-    print(f"  RMSE: {train_metrics['rmse']:.4f}")
-    print(f"  ρ:    {train_metrics['rho']:.4f}")
-    print(f"  [Normalized MAE: {train_metrics['mae_norm']:.4f}]")
-
-    print("\nValidation (raw scale 1-10):")
-    print(f"  MAE:  {val_metrics['mae']:.4f}")
-    print(f"  RMSE: {val_metrics['rmse']:.4f}")
-    print(f"  ρ:    {val_metrics['rho']:.4f}")
-    print(f"  [Normalized MAE: {val_metrics['mae_norm']:.4f}]")
-
-    # --- Regularization summary ---
-    final_model.print_regularization_summary()
-
-    # --- Save model ---
-    print("\n" + "=" * 70)
-    print("SAVING MODEL")
-    print("=" * 70)
-
-    model_path = OUTPUT_DIR / "best_model.pkl"
-    with open(model_path, 'wb') as f:
-        pickle.dump({
-            'model': final_model,
-            'params': best_params,
-            'train_metrics': train_metrics,
-            'val_metrics': val_metrics,
-            'feature_groups': feature_groups,
-            'user_stats': {
-                'mu_map': mu_map,
-                'std_map': std_map
-            },
-            'timestamp': datetime.now().isoformat()
-        }, f)
-
-    print(f"✅ Model saved: {model_path}")
-
-    # --- Save training log ---
-    log_path = OUTPUT_DIR / "training_log.json"
-
-    # ❗❗❗ 修正箇所: JSONエラー回避のためのbool->str変換 ❗❗❗
-    best_params_clean = {k: str(v) if isinstance(v, bool) else v for k, v in best_params.items()}
-
-    log_data = {
-        'timestamp': datetime.now().isoformat(),
-        'best_params': best_params_clean, # 修正後の変数を使用
-        'train_metrics': train_metrics,
-        'val_metrics': val_metrics,
-        'search_results': search_results,
-        'data_info': {
-            'train_samples': int(X_train.shape[0]),
-            'val_samples': int(X_val.shape[0]),
-            'n_features': int(X_train.shape[1]),
-            'n_users': len(mu_map) - 1
-        }
+    summary = {
+        "val": {"mae": mae, "rmse": rmse},
+        "consistency": diag["consistency"],
+        "plausibility": diag["plausibility"],
+        "personality": diag["personality"],
+        "genre_contrib_percent": group_summary["genre_contrib_percent"],
+        "cluster_info": info,
     }
 
-    with open(log_path, 'w') as f:
-        json.dump(log_data, f, indent=2)
+    # ✅ モデル保存ブロック追加
+    checkpoint = {
+        "model": model,
+        "timestamp": datetime.now().isoformat(),
+        "val_metrics": {"mae": mae, "rmse": rmse},
+        "diagnostics": diag,
+        "feature_groups": feature_groups,
+        "lambda_schedule": lambda_cfg,
+    }
 
-    print(f"✅ Training log saved: {log_path}")
+    model_path = MODEL_DIR / "best_model_clustered.pkl"
+    with open(model_path, "wb") as f:
+        pickle.dump(checkpoint, f)
 
-    print("\n" + "=" * 70)
-    print("✅ Phase 2 Complete!")
-    print("=" * 70)
-    print("\n📊 FINAL RESULTS (Raw Scale 1-10):")
-    print(f"   Train MAE:  {train_metrics['mae']:.4f}")
-    print(f"   Val MAE:    {val_metrics['mae']:.4f}")
-    print(f"   Val ρ:      {val_metrics['rho']:.4f}")
-    print("\nNext step:")
-    print("  python scripts/linear_explainable/03_evaluate.py")
+    print(f"[INFO] ✅ Model checkpoint saved -> {model_path}")
+
+    out_path = OUT_DIR / "model_quality_summary_clustered.json"
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n=== TRAINING SUMMARY (clustered) ===")
+    print(f"Val MAE={mae:.4f}, RMSE={rmse:.4f}")
+    print(f"Consistency={diag['consistency']['ConsistencyIndex']:.3f}, Plausibility={diag['plausibility']['PlausibilityIndex']:.3f}")
+    print(f"Genre contrib %: {group_summary['genre_contrib_percent']}")
+    print(f"interaction_genre reduced {info['original_dim']}→{info['clustered_dim']} ({info['reduction_ratio']*100:.1f}%)")
+    print("======================================")
+    print(f"✅ Saved summary: {out_path}")
+    print("✅ Phase 2 (clustered) complete!\n")
 
 
 if __name__ == "__main__":

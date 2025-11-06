@@ -1,343 +1,345 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Phase 1-4 (改訂版): 異種グラフの構築
-- User-Movie-Review グラフ（PyTorch辞書形式）
-- 22D review signals（18D aspect + 4D person attention）対応
-- ユーザー排他的 split の再検証
-- 充実したメタ情報の保存（aspect_names, split_meta, dims, mappings など）
+Phase 1-3 (修正版): Review特徴量の生成 + ランダムsplit
+- ユーザー重複を許可（既知ユーザーの未評価映画予測タスク）
+- 時系列を考慮しないランダム分割
+- 22D review signals（18D aspect + 4D person attention）
 
-配置: scripts/feature_engineering/04_build_graph.py
+修正内容:
+- ユーザー排他的split → ランダムsplitに変更
+- train/val/test = 70/12/18% の比率
 """
 
 import pandas as pd
 import numpy as np
 import torch
+import json
 from pathlib import Path
-from collections import defaultdict
+from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
 
 # ==================== Config ====================
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = BASE_DIR / "data"
+RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 
-REVIEW_FEATURES_PT = PROCESSED_DIR / "review_features.pt"
-USER_FEATURES_PT   = PROCESSED_DIR / "user_features.pt"
-MOVIE_FEATURES_PT  = PROCESSED_DIR / "movie_features.pt"
+REVIEWS_CSV = RAW_DIR / "reviews.csv"
+MOVIE_ENTITIES_JSON = PROCESSED_DIR / "movie_entities.json"
+ENTITY_EMBEDDINGS_PT = PROCESSED_DIR / "entity_embeddings.pt"
 
-# 学習時に参照される後方互換エイリアス:
-# graph_dict['ratings'] は raw を指す
-USE_USER_NORM_FOR_Y_ALIAS = False  # ここは保存時の 'ratings' エイリアスの方針（False: raw）
-
-# ==================== Utilities ====================
-def assert_user_disjoint_from_arrays(user_names: np.ndarray, splits: np.ndarray):
-    """
-    ユーザーが複数 split に跨っていないことをチェック。
-    問題があれば RuntimeError。
-    """
-    df = pd.DataFrame({"user_name": user_names, "split": splits})
-    g = df.groupby("user_name")["split"].nunique()
-    offenders = g[g > 1]
-    if len(offenders) > 0:
-        # 上位のみ表示しても十分（全件は巨大）
-        print("⚠ Users appearing in multiple splits (top 10):")
-        print(offenders.head(10))
-        raise RuntimeError(f"Leak detected: {len(offenders)} users appear in multiple splits.")
-
-
-def check_duplicate_edges(pair_list):
-    """
-    (user_idx, movie_idx) ペアの重複件数を返す
-    """
-    total = len(pair_list)
-    unique = len(set(pair_list))
-    return total - unique  # dup count
-
-
-def safe_tensor_stack(list_of_tensors, dtype=None):
-    """
-    list[Tensor] -> Tensor に安全に変換（空の場合は形状[0, ...]を推定して返す）
-    """
-    if len(list_of_tensors) == 0:
-        return None
-    t = torch.stack(list_of_tensors)
-    if dtype is not None:
-        t = t.to(dtype=dtype)
-    return t
-
+ASPECT_NAMES = [
+    'acting_performance', 'artistic_design', 'audio_music',
+    'casting_choices', 'character_development', 'commercial_context',
+    'comparative_analysis', 'editing_pacing', 'emotion',
+    'expectation', 'filmmaking_direction', 'genre_style',
+    'recommendation', 'story_plot', 'technical_visuals',
+    'themes_messages', 'viewing_experience', 'writing_dialogue'
+]
 
 # ==================== Load Data ====================
-print("="*70)
-print("PHASE 1-4: GRAPH CONSTRUCTION (22D Review Signals)")
-print("="*70)
-print("\nLoading processed features...")
+print("=" * 70)
+print("PHASE 1-3 FIXED: REVIEW FEATURE ENGINEERING (Random Split)")
+print("=" * 70)
+print("\nLoading data...")
 
-review_data = torch.load(REVIEW_FEATURES_PT, weights_only=False)
-user_data   = torch.load(USER_FEATURES_PT,   weights_only=False)
-movie_data  = torch.load(MOVIE_FEATURES_PT,  weights_only=False)
+reviews_df = pd.read_csv(REVIEWS_CSV)
+print(f"✓ Reviews: {len(reviews_df)}")
 
-# 基本形状
-num_users  = len(user_data['user_names'])
-num_movies = len(movie_data['movie_ids'])
-num_edges  = len(review_data['user_names'])
+with open(MOVIE_ENTITIES_JSON, 'r', encoding='utf-8') as f:
+    movie_entities_list = json.load(f)
+movie_entities = {m['movie_id']: m for m in movie_entities_list}
 
-print(f"✓ Users : {num_users}")
-print(f"✓ Movies: {num_movies}")
-print(f"✓ Reviews/Edges (raw): {num_edges}")
+entity_embeddings = torch.load(ENTITY_EMBEDDINGS_PT, weights_only=False)
 
-# ===== Review signals =====
-review_signals = review_data['features']  # shape: (N, 22) 期待
-if not isinstance(review_signals, torch.Tensor):
-    review_signals = torch.as_tensor(review_signals, dtype=torch.float32)
+print(f"✓ Movies: {len(movie_entities)}")
 
-print(f"✓ Review signals shape: {tuple(review_signals.shape)}")
-if review_signals.shape[1] == 22:
-    print("   🌟 22D review signals detected (18D aspect + 4D person attention)")
-elif review_signals.shape[1] == 18:
-    print("   ⚠ WARNING: Only 18D review signals (missing person attention)")
-else:
-    print(f"   ⚠ UNEXPECTED review signal dim: {review_signals.shape[1]}D")
+# ==================== 1. ASPECT SIGNALS ====================
+print("\n" + "=" * 70)
+print("1. ASPECT SIGNALS (18D)")
+print("=" * 70)
 
-# optional: aspect_names / split_meta
-aspect_names = review_data.get('aspect_names', None)
-if aspect_names is None:
-    # フォールバック（名称までの再現は不可だが長さ18は保証）
-    aspect_names = [f"aspect_{i}" for i in range(18)]
-split_meta = review_data.get('split_meta', {})
+mention_cols = [f'mention_{aspect}' for aspect in ASPECT_NAMES]
+sentiment_cols = [f'sentiment_{aspect}' for aspect in ASPECT_NAMES]
 
-# ==================== 1. BUILD MAPPINGS ====================
-print("\n" + "="*70)
-print("1. BUILDING ID MAPPINGS")
-print("="*70)
+mention_values = reviews_df[mention_cols].values
+sentiment_values = reviews_df[sentiment_cols].values
 
-# User name -> index
-user_name_to_idx = {name: idx for idx, name in enumerate(user_data['user_names'])}
+# Signal = mention × (sentiment - 3.0)
+aspect_signals = mention_values * (sentiment_values - 3.0)
 
-# Movie ID -> index（movie_id は int 化しているはず）
-movie_id_to_idx = {int(mid): idx for idx, mid in enumerate(movie_data['movie_ids'])}
+print(f"✓ Aspect signals: {aspect_signals.shape}")
+print(f"  Mean: {aspect_signals.mean():.4f}")
+print(f"  Std:  {aspect_signals.std():.4f}")
 
-print(f"✓ User mapping built:  {len(user_name_to_idx)} users")
-print(f"✓ Movie mapping built: {len(movie_id_to_idx)} movies")
+# ==================== 2. PERSON ATTENTION ====================
+print("\n" + "=" * 70)
+print("2. PERSON ATTENTION FEATURES (4D)")
+print("=" * 70)
 
-# ==================== 2. BUILD EDGES (by split) ====================
-print("\n" + "="*70)
-print("2. BUILDING GRAPH EDGES")
-print("="*70)
 
-splits     = np.asarray(review_data['split'])
-rev_users  = np.asarray(review_data['user_names'])
-rev_movies = np.asarray(review_data['movie_ids'])
+def get_embedding(name, emb_dict):
+    """Get embedding for a person name"""
+    if not name or pd.isna(name):
+        return None
 
-# ラベル（raw / user_norm 両方保持）
-ratings_raw       = review_data['ratings_raw']
-ratings_user_norm = review_data['ratings_user_norm']
+    name_lower = str(name).lower()
 
-edges_by_split = defaultdict(lambda: {
-    'user_indices': [],
-    'movie_indices': [],
-    'review_signals': [],
-    'ratings_raw': [],
-    'ratings_user_norm': [],
-    'review_indices': []
-})
+    for original_key in emb_dict.keys():
+        if original_key.lower() == name_lower:
+            emb = emb_dict[original_key]
+            if isinstance(emb, torch.Tensor):
+                return emb.numpy()
+            return np.array(emb)
 
-missing_users  = 0
-missing_movies = 0
+    return None
 
-print("Processing edges...")
-for i in range(len(rev_users)):
-    uname = rev_users[i]
-    mid   = int(rev_movies[i])
-    sp    = splits[i]
 
-    uidx = user_name_to_idx.get(uname)
-    if uidx is None:
-        missing_users += 1
-        continue
-    midx = movie_id_to_idx.get(mid)
-    if midx is None:
-        missing_movies += 1
-        continue
+def compute_person_attention(review_idx):
+    """Compute 4D person attention for a review"""
+    row = reviews_df.iloc[review_idx]
+    movie_id = int(row['movie_id'])
 
-    edges_by_split[sp]['user_indices'].append(uidx)
-    edges_by_split[sp]['movie_indices'].append(midx)
-    edges_by_split[sp]['review_signals'].append(review_signals[i])
-    edges_by_split[sp]['ratings_raw'].append(ratings_raw[i].item() if torch.is_tensor(ratings_raw[i]) else float(ratings_raw[i]))
-    edges_by_split[sp]['ratings_user_norm'].append(ratings_user_norm[i].item() if torch.is_tensor(ratings_user_norm[i]) else float(ratings_user_norm[i]))
-    edges_by_split[sp]['review_indices'].append(i)
+    if movie_id not in movie_entities:
+        return np.zeros(4)
 
-print(f"✓ Edges processed")
-print(f"  Missing users : {missing_users}")
-print(f"  Missing movies: {missing_movies}")
+    movie = movie_entities[movie_id]
+    movie_actors = movie.get('actors', [])
+    movie_directors = movie.get('directors', [])
 
-# ==================== 3. VERIFICATION ====================
-print("\n" + "=" * 60)
-print("【EDGE CONSTRUCTION 検証】")
-print("-" * 60)
+    # Parse mentioned persons
+    mentioned = row.get('person_name_list', None)
+    if mentioned is None or pd.isna(mentioned) or mentioned == '':
+        return np.zeros(4)
 
-total_edges = sum(len(edges_by_split[sp]['user_indices']) for sp in edges_by_split)
-expected_edges = len(rev_users) - missing_users - missing_movies
+    # ★ 修正: JSONまたはPythonリテラルとしてパース
+    try:
+        if isinstance(mentioned, str):
+            import ast
+            mentioned_list = ast.literal_eval(mentioned)
+        else:
+            mentioned_list = mentioned
 
-print(f"✅ Total edges created: {total_edges}")
-print(f"✅ Expected edges      : {expected_edges}")
-print(f"✅ Match               : {total_edges == expected_edges}")
+        if not isinstance(mentioned_list, list):
+            return np.zeros(4)
 
-if total_edges != expected_edges:
-    print("   ⚠ WARNING: Edge count mismatch!")
+        mentioned_names = [str(n).strip().lower() for n in mentioned_list if n]
+    except:
+        return np.zeros(4)
 
-# Duplicates check (per split)
-for sp in sorted(edges_by_split.keys()):
-    pairs = list(zip(edges_by_split[sp]['user_indices'], edges_by_split[sp]['movie_indices']))
-    dups = check_duplicate_edges(pairs)
-    if dups > 0:
-        print(f"   ⚠ {sp}: Found {dups} duplicate (user,movie) edges")
-    else:
-        print(f"   ✓ {sp}: No duplicate edges")
+    if len(mentioned_names) == 0:
+        return np.zeros(4)
 
-# Leak check (user-disjoint)
-try:
-    assert_user_disjoint_from_arrays(rev_users, splits)
-    print("✓ User-disjoint confirmed across splits.")
-except RuntimeError as e:
-    print(str(e))
-    # ここで止める（split は 03 の出力に準拠すべき）
-    raise
+    # Actor matching
+    actor_match = 0.0
+    for actor in movie_actors:
+        if actor.lower() in mentioned_names:
+            actor_match = 1.0
+            break
 
-print("=" * 60)
+    # Director matching
+    director_match = 0.0
+    for director in movie_directors:
+        if director.lower() in mentioned_names:
+            director_match = 1.0
+            break
 
-# ==================== 4. SAVE GRAPHS ====================
-print("\n" + "="*70)
-print("4. SAVING GRAPHS")
-print("="*70)
+    # Sentiment集約
+    actor_sentiment = 0.0
+    director_sentiment = 0.0
+    actor_count = 0
+    director_count = 0
 
-user_features  = user_data['features']  # (num_users, user_dim)
-movie_features = movie_data['features']  # (num_movies, movie_dim)
+    actor_emb_dict = entity_embeddings.get('actors', {})
+    director_emb_dict = entity_embeddings.get('directors', {})
 
-user_dim  = user_features.shape[1]
-movie_dim = movie_features.shape[1]
-review_signal_dim = review_signals.shape[1]
+    for name in mentioned_names:
+        # Check if actor
+        if name in [a.lower() for a in movie_actors]:
+            actor_emb = get_embedding(name, actor_emb_dict)
+            if actor_emb is not None:
+                sentiment = float(row.get('sentiment_acting_performance', 3.0)) - 3.0
+                actor_sentiment += sentiment
+                actor_count += 1
 
-# 作品タイトル（存在しない環境もあるため安全に取得）
-movie_titles = movie_data.get('movie_titles', None)
+        # Check if director
+        if name in [d.lower() for d in movie_directors]:
+            director_emb = get_embedding(name, director_emb_dict)
+            if director_emb is not None:
+                sentiment = float(row.get('sentiment_filmmaking_direction', 3.0)) - 3.0
+                director_sentiment += sentiment
+                director_count += 1
 
-# 保存本体
-for sp in ['train', 'val', 'test']:
-    if sp not in edges_by_split:
-        print(f"⚠ Warning: Split '{sp}' not found in data (skip saving).")
-        continue
+    # 平均を取る
+    if actor_count > 0:
+        actor_sentiment /= actor_count
+    if director_count > 0:
+        director_sentiment /= director_count
 
-    e = edges_by_split[sp]
+    return np.array([actor_match, director_match, actor_sentiment, director_sentiment])
 
-    # stack
-    e_user   = torch.tensor(e['user_indices'],  dtype=torch.long)
-    e_movie  = torch.tensor(e['movie_indices'], dtype=torch.long)
-    e_attr   = safe_tensor_stack(e['review_signals'])
-    e_y_raw  = torch.tensor(e['ratings_raw'],       dtype=torch.float32)
-    e_y_user = torch.tensor(e['ratings_user_norm'], dtype=torch.float32)
-    e_ridx   = torch.tensor(e['review_indices'],    dtype=torch.long)
 
-    # 後方互換: ratings は raw を指す（設定で切替可）
-    ratings_alias = e_y_user if USE_USER_NORM_FOR_Y_ALIAS else e_y_raw
+print("Computing person attention features...")
+person_attention_features = []
+for i in tqdm(range(len(reviews_df)), desc="Reviews"):
+    features = compute_person_attention(i)
+    person_attention_features.append(features)
 
-    graph_dict = {
-        # Node features
-        'user_features':  user_features,    # (U, Du)
-        'movie_features': movie_features,   # (M, Dm)
+person_attention_features = np.array(person_attention_features)
 
-        # Edge indices/features/labels
-        'user_indices':   e_user,           # (E,)
-        'movie_indices':  e_movie,          # (E,)
-        'review_signals': e_attr,           # (E, 22) 期待
-        'y_raw':          e_y_raw,          # (E,)
-        'y_user_norm':    e_y_user,         # (E,)
-        'ratings':        ratings_alias,    # alias for backward-compat (default: raw)
-        'review_indices': e_ridx,           # (E,)
+print(f"✓ Person attention: {person_attention_features.shape}")
+print(f"  Actor match rate: {(person_attention_features[:, 0] > 0).sum() / len(reviews_df) * 100:.1f}%")
+print(f"  Director match rate: {(person_attention_features[:, 1] > 0).sum() / len(reviews_df) * 100:.1f}%")
 
-        # Metadata
-        'num_users':      num_users,
-        'num_movies':     num_movies,
-        'num_edges':      int(e_user.numel()),
-        'split':          sp,
+# ==================== 3. COMBINE FEATURES ====================
+print("\n" + "=" * 70)
+print("3. COMBINING REVIEW FEATURES (22D)")
+print("=" * 70)
 
-        # Mappings / vocab
-        'user_name_to_idx': user_name_to_idx,
-        'movie_id_to_idx':  movie_id_to_idx,
-        'user_names':       user_data['user_names'],
-        'movie_ids':        movie_data['movie_ids'],
-        'movie_titles':     movie_titles,
+review_features = np.concatenate([
+    aspect_signals,  # 18D
+    person_attention_features  # 4D
+], axis=1)
 
-        # Dimensions
-        'user_dim':          int(user_dim),
-        'movie_dim':         int(movie_dim),
-        'review_signal_dim': int(review_signal_dim),
+print(f"✓ Review features shape: {review_features.shape}")
+print(f"  Aspect signals:    {aspect_signals.shape[1]:2d}D")
+print(f"  Person attention:  {person_attention_features.shape[1]:2d}D")
+print(f"  {'─' * 40}")
+print(f"  TOTAL:             {review_features.shape[1]:2d}D")
 
-        # Aspects & split meta
-        'aspect_names': aspect_names,
-        'split_meta':   split_meta,
-    }
+# ==================== 4. RANDOM SPLIT (ユーザー重複OK) ====================
+print("\n" + "=" * 70)
+print("4. RANDOM SPLIT (User Overlap Allowed)")
+print("=" * 70)
 
-    out_path = PROCESSED_DIR / f"hetero_graph_{sp}.pt"
-    torch.save(graph_dict, out_path)
-    print(f"✅ Saved: {out_path}")
-    print(f"   Nodes: {graph_dict['num_users']} users, {graph_dict['num_movies']} movies")
-    print(f"   Edges: {graph_dict['num_edges']}")
-    print(f"   Review signals: {graph_dict['review_signal_dim']}D")
+n_reviews = len(reviews_df)
+n_train = int(n_reviews * 0.70)
+n_val = int(n_reviews * 0.12)
+n_test = n_reviews - n_train - n_val
 
-# ==================== 5. SUMMARY ====================
-print("\n" + "="*70)
-print("GRAPH CONSTRUCTION SUMMARY")
-print("="*70)
+print(f"Total reviews: {n_reviews:,}")
+print(f"  Train: {n_train:,} ({n_train / n_reviews * 100:.1f}%)")
+print(f"  Val:   {n_val:,} ({n_val / n_reviews * 100:.1f}%)")
+print(f"  Test:  {n_test:,} ({n_test / n_reviews * 100:.1f}%)")
 
-for sp in ['train', 'val', 'test']:
-    if sp not in edges_by_split:
-        continue
-    e = edges_by_split[sp]
-    n = len(e['user_indices'])
-    if n == 0:
-        print(f"{sp.upper()}: (no edges)")
-        continue
+# Random shuffle
+np.random.seed(42)
+indices = np.random.permutation(n_reviews)
 
-    r = np.array(e['ratings_raw'], dtype=np.float32)
-    print(f"\n{sp.upper()}:")
-    print(f"  Edges: {n:,}")
-    print(f"  Raw rating - Mean: {r.mean():.2f}, Std: {r.std():.2f}")
+train_indices = indices[:n_train]
+val_indices = indices[n_train:n_train + n_val]
+test_indices = indices[n_train + n_val:]
 
-    # Band distribution for raw ratings
-    low  = ((r >= 1) & (r <= 4)).sum()
-    mid  = ((r >= 5) & (r <= 7)).sum()
-    high = ((r >= 8) & (r <= 10)).sum()
+splits = np.empty(n_reviews, dtype='U5')
+splits[train_indices] = 'train'
+splits[val_indices] = 'val'
+splits[test_indices] = 'test'
 
-    print(f"  Low (1-4):   {low:6d} ({low/n*100:5.1f}%)")
-    print(f"  Mid (5-7):   {mid:6d} ({mid/n*100:5.1f}%)")
-    print(f"  High (8-10): {high:6d} ({high/n*100:5.1f}%)")
+# Verify user overlap
+train_users = set(reviews_df.iloc[train_indices]['user_name'].unique())
+val_users = set(reviews_df.iloc[val_indices]['user_name'].unique())
+test_users = set(reviews_df.iloc[test_indices]['user_name'].unique())
 
-print("\n" + "=" * 60)
-print("【FEATURE DIMENSIONS】")
-print("-" * 60)
-print(f"User features:   {user_dim:4d}D")
-ufd = user_data.get('feature_dims', {})
-for k in ['zscore', 'sentiment', 'stats', 'fav_actor_emb', 'fav_actor_count', 'fav_director_emb']:
-    if k in ufd:
-        print(f"  - {k:15s}: {ufd[k]:4d}D")
+print("\n✓ User Statistics:")
+print(f"  Train unique users: {len(train_users)}")
+print(f"  Val unique users:   {len(val_users)}")
+print(f"  Test unique users:  {len(test_users)}")
+print(f"\n✓ User Overlap (Allowed):")
+print(f"  Train ∩ Val:  {len(train_users & val_users)}")
+print(f"  Train ∩ Test: {len(train_users & test_users)}")
+print(f"  Val ∩ Test:   {len(val_users & test_users)}")
 
-print(f"\nMovie features:  {movie_dim:4d}D")
-mfd = movie_data.get('feature_dims', {})
-for k in ['genre', 'actor_emb', 'director_emb', 'keyword_emb', 'runtime_year', 'tags', 'review_agg']:
-    if k in mfd:
-        print(f"  - {k:15s}: {mfd[k]:4d}D")
+# ==================== 5. RATING NORMALIZATION ====================
+print("\n" + "=" * 70)
+print("5. RATING NORMALIZATION")
+print("=" * 70)
 
-print(f"\n✨ Review signals: {review_signal_dim:4d}D")
-if review_signal_dim == 22:
-    print(f"  - Aspect signals:      18D")
-    print(f"  - Person attention:     4D")
-print("=" * 60)
+ratings_raw = reviews_df['rating_raw'].values
 
-print("\n" + "="*70)
-print("🎉 PHASE 1-4 COMPLETE!")
-print("="*70)
-print("\nAll graph files saved:")
-for sp in ['train', 'val', 'test']:
-    out_path = PROCESSED_DIR / f"hetero_graph_{sp}.pt"
-    print(f"  - {out_path}")
+# User-wise normalization
+user_stats = {}
+for user_name in reviews_df['user_name'].unique():
+    user_mask = (reviews_df['user_name'] == user_name).values
+    user_ratings = ratings_raw[user_mask]
+
+    mu = user_ratings.mean()
+    std = user_ratings.std()
+    if std < 1e-6:
+        std = 1.0
+
+    user_stats[user_name] = {'mu': float(mu), 'std': float(std)}
+
+ratings_user_norm = np.zeros_like(ratings_raw, dtype=np.float32)
+for i, user_name in enumerate(reviews_df['user_name']):
+    mu = user_stats[user_name]['mu']
+    std = user_stats[user_name]['std']
+    ratings_user_norm[i] = (ratings_raw[i] - mu) / std
+
+print(f"✓ Raw ratings:  μ={ratings_raw.mean():.2f}, σ={ratings_raw.std():.2f}")
+print(f"✓ Normalized:   μ={ratings_user_norm.mean():.2f}, σ={ratings_user_norm.std():.2f}")
+
+# ==================== 6. SAVE ====================
+print("\n" + "=" * 70)
+print("6. SAVING FEATURES")
+print("=" * 70)
+
+review_features_dict = {
+    'features': torch.tensor(review_features, dtype=torch.float32),
+    'ratings_raw': torch.tensor(ratings_raw, dtype=torch.float32),
+    'ratings_user_norm': torch.tensor(ratings_user_norm, dtype=torch.float32),
+    'user_names': reviews_df['user_name'].values,
+    'movie_ids': reviews_df['movie_id'].values,
+    'split': splits,
+    'aspect_names': ASPECT_NAMES,
+    'feature_dims': {
+        'aspect_signals': aspect_signals.shape[1],
+        'person_attention': person_attention_features.shape[1],
+        'total': review_features.shape[1]
+    },
+    'split_meta': {
+        'method': 'random',
+        'user_overlap': 'allowed',
+        'train_size': int(n_train),
+        'val_size': int(n_val),
+        'test_size': int(n_test),
+        'random_seed': 42
+    },
+    'user_stats': user_stats
+}
+
+output_path = PROCESSED_DIR / "review_features.pt"
+torch.save(review_features_dict, output_path)
+print(f"✅ Saved: {output_path}")
+
+# ==================== 7. SUMMARY ====================
+print("\n" + "=" * 70)
+print("SUMMARY")
+print("=" * 70)
+
+for split_name in ['train', 'val', 'test']:
+    mask = splits == split_name
+    n = mask.sum()
+    r = ratings_raw[mask]
+
+    print(f"\n{split_name.upper()}:")
+    print(f"  Reviews: {n:,}")
+    print(f"  Rating - Mean: {r.mean():.2f}, Std: {r.std():.2f}")
+
+    low = ((r >= 1) & (r < 4)).sum()
+    mid = ((r >= 4) & (r < 7)).sum()
+    high = (r >= 7).sum()
+
+    print(f"  Low (1-4):   {low:6d} ({low / n * 100:5.1f}%)")
+    print(f"  Mid (4-7):   {mid:6d} ({mid / n * 100:5.1f}%)")
+    print(f"  High (7-10): {high:6d} ({high / n * 100:5.1f}%)")
+
+print("\n" + "=" * 70)
+print("🎉 PHASE 1-3 FIXED COMPLETE!")
+print("=" * 70)
+print("\n✅ Data split method: Random (user overlap allowed)")
+print("✅ This evaluates: Known user + unseen movie prediction")
+print("\nNext step:")
+print("  python scripts/feature_engineering/04_build_graph.py")
